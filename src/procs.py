@@ -3,9 +3,6 @@ from graphviewer import Node, Insn, Proc
 
 
 class Proc_x86_64(Proc):
-	def __init__(self):
-		super().__init__()
-
 	def is_prolog(self, node: Node):
 		pat = [
 			["push rbp"],

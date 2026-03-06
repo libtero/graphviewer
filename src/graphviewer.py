@@ -1,6 +1,11 @@
+import os
 import ida_graph
 import idc
 import ida_lines
+import ida_ua
+import json
+import re
+from typing import Iterable
 from enum import IntEnum
 from abc import ABC, abstractmethod
 
@@ -12,9 +17,6 @@ class COLOR(IntEnum):
 
 
 class Proc(ABC):
-	def __init__(self):
-		pass
-
 	@abstractmethod
 	def is_prolog(self, node: 'Node') -> bool:
 		pass
@@ -33,26 +35,55 @@ class Insn:
 		self.ea = ea
 		self.proc = proc
 		self.asmTagged = self._get_asm()
-		assert self.asmTagged, "Insn assembly decoding failed @ {self.ea:08X}"
+		assert self.asmTagged, f"Insn assembly decoding failed @ {self.ea:08X}"
 		self.asm = ida_lines.tag_remove(self.asmTagged)
 		self.mn = self._get_mn()
+		self.size = self._get_size()
+		assert self.size, "Insn size decoding failed @ {self.ea:08X}"
 		self.line = self._get_line()
 		self.isControlFlow = self._is_control_flow()
 		self.nextInsnEas: set[int] = set()
+		self.nextInsnExecFlow: list[int] = list()
 		self.cmts: list[str] = list()
+		self.parent: Node | None = None
+
+	@classmethod
+	def from_dict(cls, proc: Proc, info: dict) -> 'Insn':
+		insn = cls.__new__(cls)
+		insn.proc = proc
+		insn.ea = info["ea"]
+		insn.asmTagged = info["asmTagged"]
+		insn.asm = info["asm"]
+		insn.mn = info["mn"]
+		insn.size = info["size"]
+		insn.line = info["line"]
+		insn.isControlFlow = info["isControlFlow"]
+		insn.nextInsnEas = set(info["nextInsnEas"])
+		insn.nextInsnExecFlow = info["nextInsnExecFlow"]
+		insn.cmts = info["cmts"]
+		insn.parent = None
+		return insn
 
 	def _get_asm(self):
 		return ida_lines.generate_disasm_line(self.ea, ida_lines.GENDSM_FORCE_CODE)
-	
+
 	def _get_mn(self):
 		return self.asm.replace(",", "").split()[0].lower()
 
+	def _get_size(self):
+		insn = ida_ua.insn_t()  # type: ignore
+		return ida_ua.decode_insn(insn, self.ea)
+
 	def _get_line(self):
 		return (
-			ida_lines.COLSTR(f"{self.ea:08X}", ida_lines.SCOLOR_KEYWORD)
-			+ "    "
-			+ self.asmTagged
+				ida_lines.COLSTR(f"{self.ea:08X}", ida_lines.SCOLOR_KEYWORD)
+				+ "    "
+				+ self.asmTagged
 		)
+
+	def add_insn_exec_flow(self, ea: int):
+		if not self.nextInsnExecFlow or self.nextInsnExecFlow[-1] != ea:
+			self.nextInsnExecFlow.append(ea)
 
 	def _is_control_flow(self) -> bool:
 		return self.proc.is_cf(self)
@@ -74,14 +105,30 @@ class Insn:
 				result.append(f"{pad}{ida_lines.COLSTR(txt, color)}")
 			return "\n".join(result)
 
+	def serialize(self) -> dict:
+		info = {
+			"ea": self.ea,
+			"asmTagged": self.asmTagged,
+			"asm": self.asm,
+			"mn": self.mn,
+			"size": self.size,
+			"line": self.line,
+			"isControlFlow": self.isControlFlow,
+			"nextInsnEas": list(self.nextInsnEas),
+			"nextInsnExecFlow": self.nextInsnExecFlow,
+			"cmts": [],  # comments are later added by Graph class
+		}
+		return info
+
 
 class Node:
 	def __init__(self, start_ea: int):
 		self.ea = start_ea
 		self.id = int()
-		self.body = self._get_label(start_ea)
+		self.body = self._get_label(self.ea)
 		self.color = idc.DEFCOLOR
 		self.insns: dict[int, Insn] = dict()
+		self.toEdges: list[Node] = list()
 
 	def _get_label(self, ea: int) -> str:
 		ea_name = idc.get_name(ea, idc.GN_DEMANGLED)
@@ -92,10 +139,11 @@ class Node:
 	def add_insn_dis(self, insn: Insn):
 		self.body += insn.line + insn.get_cmts() + "\n"
 
-	def add_insn(self, inst: Insn):
-		if inst.ea in self.insns:
+	def add_insn(self, insn: Insn):
+		if insn.ea in self.insns:
 			return
-		self.insns[inst.ea] = inst
+		insn.parent = self
+		self.insns[insn.ea] = insn
 
 	def finalize_body(self):
 		for ea, insn in sorted(self.insns.items()):
@@ -108,52 +156,49 @@ class Node:
 		del self.insns[ea]
 
 	def has_insn(self, ea: int) -> bool:
-		return self.get_insn(ea) != None
+		return self.get_insn(ea) is not None
 
 	def set_color(self, color: COLOR):
 		self.color = color
 
+	def get_all_insns(self) -> Iterable[Insn]:
+		return [insn for insn in self.insns.values()]
+
+	def get_last_insn(self) -> Insn:
+		return self.insns[sorted(self.insns.keys())[-1]]
+
 
 class Graph(ida_graph.GraphViewer):
-	def __init__(self, proc: Proc):
-		super().__init__("Trace Graph", True)
+	def __init__(self, name: str, proc: Proc, close_open=False):
+		super().__init__(name, close_open)
 		self.proc = proc
 		self.nodes: dict[int, Node] = dict()
 		self.execOrder: list[int] = list()
 		self.insns: dict[int, Insn] = dict()
 		self.lastInsn: Insn | None = None
 		self.insnCmts: dict[int, list[str]] = dict()
+		self._finalized = False
 
-	def OnRefresh(self):
-		self._finalize()
-		return True
-
-	def OnGetText(self, node_id):
-		return self.GetNodeText(node_id)
-
-	def GetNodeText(self, node_id):
-		node = self._nodes[node_id]
-		return (node.body, node.color)
-
-	def Show(self):
-		super().Show()
-
-	# ------------------------ CUSTOM DEFS ------------------------
-
-	def _add_node(self, node):
+	def _add_node(self, node: Node):
 		node.id = self.AddNode(node)
 		self.nodes[node.ea] = node
 
-	def add_edge(self, frm, to):
+	def add_edge(self, frm: Node, to: Node):
 		self.AddEdge(frm.id, to.id)
+		if to == frm:
+			return
+		if not to in frm.toEdges:
+			frm.toEdges.append(to)
 
 	def get_node_by_start_ea(self, ea: int) -> Node | None:
 		return self.nodes.get(ea, None)
 
 	def get_node_with_ea(self, ea: int) -> Node | None:
-		for node in self.nodes.values():
-			if ea in node.insns.keys():
-				return node
+		if insn := self.insns.get(ea, None):
+			node = insn.parent
+			assert node is not None, "Insn.parent is None"
+			return node
+		return None
 
 	def _assign_insns(self):
 		if not (node := self.get_node_by_start_ea(self.execOrder[0])):
@@ -177,7 +222,7 @@ class Graph(ida_graph.GraphViewer):
 			self._add_node(node)
 		return node
 
-	def _count_duplicates_from_next_ea(self) -> list[int]:
+	def _get_duplicates_from_next_ea(self) -> list[int]:
 		result = dict()
 		for insn in self.insns.values():
 			for ea in insn.nextInsnEas:
@@ -190,7 +235,7 @@ class Graph(ida_graph.GraphViewer):
 			if insn.isControlFlow and insn.nextInsnEas:
 				for ea in insn.nextInsnEas:
 					self._get_create_node(ea)
-		for ea in self._count_duplicates_from_next_ea():
+		for ea in self._get_duplicates_from_next_ea():
 			self._get_create_node(ea)
 
 	def _sanity_check(self):
@@ -217,7 +262,7 @@ class Graph(ida_graph.GraphViewer):
 		if node := self.get_node_with_ea(ea):
 			return node.get_insn(ea)
 		return None
-	
+
 	def clear_insn_cmt(self, ea: int):
 		if self.insnCmts.get(ea, None):
 			del self.insnCmts[ea]
@@ -247,14 +292,20 @@ class Graph(ida_graph.GraphViewer):
 		if last_node := self.get_node_with_ea(self.execOrder[-1]):
 			last_node.set_color(COLOR.LAST_INSN)
 
+	def get_all_nodes(self) -> list[Node]:
+		return [node for node in self.nodes.values()]
+
 	def process(self, ea: int):
 		self.execOrder.append(ea)
 		insn = self.insns.setdefault(ea, Insn(ea, self.proc))
 		if self.lastInsn:
 			self.lastInsn.nextInsnEas.add(ea)
+			self.lastInsn.add_insn_exec_flow(ea)
 		self.lastInsn = insn
 
-	def _finalize(self):
+	def finalize(self):
+		if self._finalized:
+			return
 		self._create_nodes()
 		self._assign_insns()
 		self._assign_cmts()
@@ -262,3 +313,47 @@ class Graph(ida_graph.GraphViewer):
 		self._create_edges()
 		self._assign_node_colors()
 		self._sanity_check()
+		self._finalized = True
+
+	# ------------------------ SAVING & LOADING ------------------------
+
+	def save(self, path: str):
+		if not self._finalized:
+			self.finalize()
+		info = dict()
+		info["execOrder"] = self.execOrder
+		info["insns"] = [insn.serialize() for insn in self.insns.values()]
+		info["lastInsn"] = self.lastInsn.ea
+		info["insnCmts"] = self.insnCmts
+		data = json.dumps(info, separators=(",", ":"))
+		with open(path, "w") as fh:
+			fh.write(data)
+
+	def load(self, path: str):
+		assert os.access(path, os.R_OK), f'Invalid path: "{path}"'
+		with open(path, "r") as fh:
+			data = fh.read()
+		info = json.loads(data)
+		self.execOrder = info["execOrder"]
+		self.insns = {insn["ea"]: Insn.from_dict(self.proc, insn) for insn in info["insns"]}
+		self.lastInsn = self.insns[info["lastInsn"]]
+		assert self.lastInsn
+		self.insnCmts = {int(ea): cmt for ea, cmt in info["insnCmts"].items()}
+		self.finalize()
+
+	# ------------------------ INHERITED ------------------------
+
+	def OnRefresh(self):
+		if not self._finalized:
+			self.finalize()
+		return True
+
+	def OnGetText(self, node_id):
+		return self.GetNodeText(node_id)
+
+	def GetNodeText(self, node_id):
+		node = self._nodes[node_id]
+		return (node.body, node.color)
+
+	def Show(self):
+		super().Show()
