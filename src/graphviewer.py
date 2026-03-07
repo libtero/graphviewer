@@ -4,7 +4,7 @@ import idc
 import ida_lines
 import ida_ua
 import json
-import re
+import ida_nalt
 from typing import Iterable
 from enum import IntEnum
 from abc import ABC, abstractmethod
@@ -130,6 +130,12 @@ class Node:
 		self.insns: dict[int, Insn] = dict()
 		self.toEdges: list[Node] = list()
 
+	def __str__(self):
+		s = f" [NODE #{self.id} @ {self.ea:X}] ".center(32, "=") + "\n"
+		s += ida_lines.tag_remove(self.body)
+		s += f"[EDGES] " + ",".join(f"{node.ea:X}" for node in self.toEdges)
+		return s
+
 	def _get_label(self, ea: int) -> str:
 		ea_name = idc.get_name(ea, idc.GN_DEMANGLED)
 		if ea_name:
@@ -178,6 +184,12 @@ class Graph(ida_graph.GraphViewer):
 		self.lastInsn: Insn | None = None
 		self.insnCmts: dict[int, list[str]] = dict()
 		self._finalized = False
+
+	def __str__(self):
+		s = " GraphViewer".center(32, "=") + "\n"
+		s += self.info_to_str(self.get_info()) + "\n"
+		s += "\n\n".join([str(node) for node in self.nodes.values()])
+		return s
 
 	def _add_node(self, node: Node):
 		node.id = self.AddNode(node)
@@ -315,12 +327,58 @@ class Graph(ida_graph.GraphViewer):
 		self._sanity_check()
 		self._finalized = True
 
+	# ------------------------ MISC ------------------------
+
+	def get_info(self) -> dict:
+		info = {
+			"database": idc.get_root_filename(),
+			"crc": ida_nalt.retrieve_input_file_crc32(),
+			"imagebase": ida_nalt.get_imagebase(),
+			"nodeCount": len(self.nodes),
+			"insnCount": len(self.insns),
+			"startEa": self.execOrder[0],
+		}
+		return info
+
+	@staticmethod
+	def info_to_str(info: dict) -> str:
+		s = f"[+] database: {info['database']}" + "\n"
+		s += f"[+] crc: {info['crc']:X}" + "\n"
+		s += f"[+] imagebase: {info['imagebase']:X}" + "\n"
+		s += f"[+] nodes: {info['nodeCount']}" + "\n"
+		s += f"[+] instructions: {info['insnCount']}" + "\n"
+		s += f"[+] start: {info['startEa']:X} ({info['startEa'] - info['imagebase']:X})" + "\n"
+		return s
+
+	def dot(self) -> str:
+		"""
+		Return in graphviz .dot format
+		"""
+		if not self._finalized:
+			self.finalize()
+		dot = list()
+		dot.append('digraph "GraphViewer" {')
+		dot.append('graph [bgcolor="#E4F7FE", rankdir=TB, pad=1, margin=0];')
+		dot.append(
+			'node [fontname="monospace", fontsize=13, shape=box, style=filled, penwidth=1.0, margin="0.15,0.1", fillcolor="#FFFFFF", fontcolor="#00087B"];')
+		dot.append('edge [fontname="Arial", fontsize=8, color="#333333", penwidth=1.5, arrowhead=vee];')
+		for node in self.nodes.values():
+			processed = []
+			for line in ida_lines.tag_remove(node.body).splitlines():
+				processed.append(f'{line}<br align="left"/>')
+			dot.append(f'"loc_{node.ea:X}" [label=<{"".join(processed)}>];')
+			for target in node.toEdges:
+				dot.append(f'"loc_{node.ea:X}" -> "loc_{target.ea:X}";')
+		dot.append('}')
+		return "\n".join(dot)
+
 	# ------------------------ SAVING & LOADING ------------------------
 
 	def save(self, path: str):
 		if not self._finalized:
 			self.finalize()
 		info = dict()
+		info["info"] = self.get_info()
 		info["execOrder"] = self.execOrder
 		info["insns"] = [insn.serialize() for insn in self.insns.values()]
 		info["lastInsn"] = self.lastInsn.ea
@@ -328,6 +386,8 @@ class Graph(ida_graph.GraphViewer):
 		data = json.dumps(info, separators=(",", ":"))
 		with open(path, "w") as fh:
 			fh.write(data)
+		print(" GraphViewer Save ".center(32, "="))
+		print(self.info_to_str(info["info"]))
 
 	def load(self, path: str):
 		assert os.access(path, os.R_OK), f'Invalid path: "{path}"'
@@ -340,6 +400,8 @@ class Graph(ida_graph.GraphViewer):
 		assert self.lastInsn
 		self.insnCmts = {int(ea): cmt for ea, cmt in info["insnCmts"].items()}
 		self.finalize()
+		print(" GraphViewer Load ".center(32, "="))
+		print(self.info_to_str(info["info"]))
 
 	# ------------------------ INHERITED ------------------------
 

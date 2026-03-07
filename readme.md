@@ -18,7 +18,9 @@ This tool solves that problem by converting execution traces recorded from debug
 - Distinctly colors the final executed block for easy orientation.
 - Supports multi-line comments per instruction, allowing you to embed trace metadata (like register values) directly into the graph.
 - Built on an extensible `Proc` base class, making it easy to support custom architectures.
-- Persist and reload graphs to disk for later analysis.
+- Save and load complete graphs to and from disk for later analysis.
+- Allows exporting to Graphviz `.dot` format for visualization and further analysis.
+
 
 ## Usage
 
