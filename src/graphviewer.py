@@ -63,7 +63,7 @@ class Insn:
 		insn.line = info["line"]
 		insn.isControlFlow = info["isControlFlow"]
 		insn.nextInsnEas = set(info["nextInsnEas"])
-		insn.cmts = info["cmts"]
+		insn.cmts = list()
 		insn.parent = None
 		return insn
 
@@ -104,10 +104,10 @@ class Insn:
 				result.append(f"{pad}{ida_lines.COLSTR(txt, color)}")
 			return "\n".join(result)
 
-	def set_highlight(self, color = ida_lines.SCOLOR_IMPNAME):
+	def _set_highlight(self, color):
 		self.line = ida_lines.COLSTR(ida_lines.tag_remove(self.line), color)
 
-	def unset_highlight(self):
+	def _unset_highlight(self):
 		self.line = self._get_line()
 
 	def serialize(self) -> dict:
@@ -117,10 +117,9 @@ class Insn:
 			"asm": self.asm,
 			"mn": self.mn,
 			"size": self.size,
-			"line": self.line,
+			"line": self._get_line(), # get line without highlight (added later by Graph class)
 			"isControlFlow": self.isControlFlow,
 			"nextInsnEas": list(self.nextInsnEas),
-			"cmts": [],  # comments are later added by Graph class
 		}
 		return info
 
@@ -187,6 +186,7 @@ class Graph(ida_graph.GraphViewer):
 		self.insns: dict[int, Insn] = dict()
 		self.lastInsn: Insn | None = None
 		self.insnCmts: dict[int, list[str]] = dict()
+		self.insnHighlights: dict[int, str] = dict()
 		self._finalized = False
 		self._restart = False
 
@@ -296,11 +296,26 @@ class Graph(ida_graph.GraphViewer):
 
 	def get_insn_cmts(self, ea: int) -> str:
 		return "\n".join(self.insnCmts.get(ea, list()))
+	
+	def set_insn_highlight(self, ea: int, color =  ida_lines.SCOLOR_IMPNAME):
+		self.insnHighlights[ea] = color
 
-	def _assign_cmts(self):
+	def unset_insn_highlight(self, ea: int):
+		if self.insnHighlights.get(ea, None):
+			del self.insnHighlights[ea]
+
+	def clear_insn_highlights(self):
+		self.insnHighlights = dict()
+
+	def _assign_insn_cmts(self):
 		for ea, cmts in self.insnCmts.items():
 			if insn := self.get_insn(ea):
 				insn.cmts = cmts
+
+	def _assign_insn_highlights(self):
+		for ea, color in self.insnHighlights.items():
+			if insn := self.get_insn(ea):
+				insn._set_highlight(color)
 
 	def _assign_node_colors(self):
 		for node in self.nodes.values():
@@ -334,7 +349,8 @@ class Graph(ida_graph.GraphViewer):
 			return
 		self._create_nodes()
 		self._assign_insns()
-		self._assign_cmts()
+		self._assign_insn_cmts()
+		self._assign_insn_highlights()
 		self._finalize_nodes()
 		self._create_edges()
 		self._assign_node_colors()
@@ -390,6 +406,7 @@ class Graph(ida_graph.GraphViewer):
 	# ------------------------ SAVING & LOADING ------------------------
 
 	def save(self, path: str):
+		assert self.execOrder, "Nothing to save"
 		if not self._finalized:
 			self.finalize()
 		info = dict()
@@ -398,6 +415,7 @@ class Graph(ida_graph.GraphViewer):
 		info["insns"] = [insn.serialize() for insn in self.insns.values()]
 		info["lastInsn"] = self.lastInsn.ea
 		info["insnCmts"] = self.insnCmts
+		info["insnHighlights"] = self.insnHighlights
 		data = json.dumps(info, separators=(",", ":"))
 		with open(path, "w") as fh:
 			fh.write(data)
@@ -414,7 +432,7 @@ class Graph(ida_graph.GraphViewer):
 		self.lastInsn = self.insns[info["lastInsn"]]
 		assert self.lastInsn
 		self.insnCmts = {int(ea): cmt for ea, cmt in info["insnCmts"].items()}
-		self.finalize()
+		self.insnHighlights = {int(ea): color for ea, color in info["insnHighlights"].items()}
 		print(" GraphViewer Load ".center(32, "="))
 		print(self.info_to_str(info["info"]))
 

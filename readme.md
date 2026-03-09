@@ -63,7 +63,7 @@ trace_graph.Show()
 ```
 
 #### Processing Multiple Execution Passes
-When re-running the same code from the start (e.g. a loop iteration or a second emulation pass), call `.restart()` before feeding the first instruction of the new pass. Without it, GraphViewer would incorrectly create an edge from the last instruction to the starting instruction.
+When re-running the same code from the start (e.g. a second emulation pass), call `.restart()` before feeding the first instruction of the new pass. Without it, GraphViewer would incorrectly create an edge from the last instruction to the starting instruction. Because functions can call themselves recursively, GraphViewer cannot automatically determine when a new pass begins — it is up to the user to decide when it does.
 
 ```python
 proc = Proc_x86_64()
@@ -101,28 +101,16 @@ trace_graph.Show()
 ```
 
 #### Highlighting Instructions
-Individual instructions can be visually highlighted in the graph using `.set_highlight()` on an `Insn` object. This is useful for drawing attention to instructions of interest — such as tainted data sources, suspicious memory accesses, or any instruction identified during analysis.
+Individual instructions can be visually highlighted in the graph using `.set_insn_highlight()` on the `Graph` object. This is useful for drawing attention to instructions of interest — such as tainted data sources, suspicious memory accesses, or any instruction identified during analysis.
 
-By default, `.set_highlight()` uses `SCOLOR_IMPNAME` (typically pink), but any IDA's `SCOLOR_` color constant can be passed.
+By default, `.set_insn_highlight()` uses `SCOLOR_IMPNAME` (typically pink), but any IDA's `SCOLOR_` color constant can be passed.
 
 ```python
-trace_graph.finalize()
-
 tainted_eas = [0x140001008, 0x14000100D]
 for ea in tainted_eas:
-    insn = trace_graph.get_insn(ea)
-    if insn:
-        insn.set_highlight()
+    trace_graph.set_insn_highlight(ea)
 
 trace_graph.Show()
-```
-
-To revert an instruction back to its default appearance:
-
-```python
-insn = trace_graph.get_insn(0x140001008)
-if insn:
-    insn.unset_highlight()
 ```
 
 ## Important Notes
