@@ -1,5 +1,5 @@
 import ida_lines
-from graphviewer import Node, Insn, Proc
+from .graphviewer import Node, Insn, Proc
 
 
 class Proc_x86_64(Proc):

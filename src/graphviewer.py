@@ -5,7 +5,6 @@ import ida_lines
 import ida_ua
 import json
 import ida_nalt
-from typing import Iterable
 from enum import IntEnum
 from abc import ABC, abstractmethod
 
@@ -30,20 +29,25 @@ class Proc(ABC):
 		pass
 
 
+class InsnDecodeException(Exception):
+	pass
+
+
 class Insn:
 	def __init__(self, ea: int, proc: Proc):
 		self.ea = ea
 		self.proc = proc
 		self.asmTagged = self._get_asm()
-		assert self.asmTagged, f"Insn assembly decoding failed @ {self.ea:08X}"
+		if not self.asmTagged:
+			raise InsnDecodeException(f"Insn assembly decoding failed @ {self.ea:08X}")
 		self.asm = ida_lines.tag_remove(self.asmTagged)
 		self.mn = self._get_mn()
 		self.size = self._get_size()
-		assert self.size, "Insn size decoding failed @ {self.ea:08X}"
+		if not self.size:
+			raise InsnDecodeException(f"Insn size decoding failed @ {self.ea:08X}")
 		self.line = self._get_line()
 		self.isControlFlow = self._is_control_flow()
 		self.nextInsnEas: set[int] = set()
-		self.nextInsnExecFlow: list[int] = list()
 		self.cmts: list[str] = list()
 		self.parent: Node | None = None
 
@@ -59,7 +63,6 @@ class Insn:
 		insn.line = info["line"]
 		insn.isControlFlow = info["isControlFlow"]
 		insn.nextInsnEas = set(info["nextInsnEas"])
-		insn.nextInsnExecFlow = info["nextInsnExecFlow"]
 		insn.cmts = info["cmts"]
 		insn.parent = None
 		return insn
@@ -81,10 +84,6 @@ class Insn:
 				+ self.asmTagged
 		)
 
-	def add_insn_exec_flow(self, ea: int):
-		if not self.nextInsnExecFlow or self.nextInsnExecFlow[-1] != ea:
-			self.nextInsnExecFlow.append(ea)
-
 	def _is_control_flow(self) -> bool:
 		return self.proc.is_cf(self)
 
@@ -105,6 +104,12 @@ class Insn:
 				result.append(f"{pad}{ida_lines.COLSTR(txt, color)}")
 			return "\n".join(result)
 
+	def set_highlight(self, color = ida_lines.SCOLOR_IMPNAME):
+		self.line = ida_lines.COLSTR(ida_lines.tag_remove(self.line), color)
+
+	def unset_highlight(self):
+		self.line = self._get_line()
+
 	def serialize(self) -> dict:
 		info = {
 			"ea": self.ea,
@@ -115,7 +120,6 @@ class Insn:
 			"line": self.line,
 			"isControlFlow": self.isControlFlow,
 			"nextInsnEas": list(self.nextInsnEas),
-			"nextInsnExecFlow": self.nextInsnExecFlow,
 			"cmts": [],  # comments are later added by Graph class
 		}
 		return info
@@ -167,7 +171,7 @@ class Node:
 	def set_color(self, color: COLOR):
 		self.color = color
 
-	def get_all_insns(self) -> Iterable[Insn]:
+	def get_all_insns(self) -> list[Insn]:
 		return [insn for insn in self.insns.values()]
 
 	def get_last_insn(self) -> Insn:
@@ -184,6 +188,7 @@ class Graph(ida_graph.GraphViewer):
 		self.lastInsn: Insn | None = None
 		self.insnCmts: dict[int, list[str]] = dict()
 		self._finalized = False
+		self._restart = False
 
 	def __str__(self):
 		s = " GraphViewer".center(32, "=") + "\n"
@@ -224,8 +229,8 @@ class Graph(ida_graph.GraphViewer):
 		for insn in self.insns.values():
 			for ea in insn.nextInsnEas:
 				if dst := self.get_node_by_start_ea(ea):
-					src = self.get_node_with_ea(insn.ea)
-					self.add_edge(src, dst)
+					if src := self.get_node_with_ea(insn.ea):
+						self.add_edge(src, dst)
 
 	def _get_create_node(self, ea: int) -> Node:
 		node = self.get_node_by_start_ea(ea)
@@ -271,9 +276,7 @@ class Graph(ida_graph.GraphViewer):
 			node.finalize_body()
 
 	def get_insn(self, ea: int) -> Insn | None:
-		if node := self.get_node_with_ea(ea):
-			return node.get_insn(ea)
-		return None
+		return self.insns.get(ea, None)
 
 	def clear_insn_cmt(self, ea: int):
 		if self.insnCmts.get(ea, None):
@@ -286,6 +289,10 @@ class Graph(ida_graph.GraphViewer):
 				lst.append(cmt)
 		else:
 			lst.append(cmt)
+
+	def set_insn_cmt(self, ea: int, cmt: str):
+		self.insnCmts.pop(ea, None)
+		self.add_insn_cmt(ea, cmt)
 
 	def get_insn_cmts(self, ea: int) -> str:
 		return "\n".join(self.insnCmts.get(ea, list()))
@@ -308,12 +315,19 @@ class Graph(ida_graph.GraphViewer):
 		return [node for node in self.nodes.values()]
 
 	def process(self, ea: int):
-		self.execOrder.append(ea)
 		insn = self.insns.setdefault(ea, Insn(ea, self.proc))
+		self.execOrder.append(ea)
+		if self._restart:
+			self._restart = False
+			self.lastInsn = None
+			return
 		if self.lastInsn:
 			self.lastInsn.nextInsnEas.add(ea)
-			self.lastInsn.add_insn_exec_flow(ea)
 		self.lastInsn = insn
+
+	def restart(self):
+		"""Signal that you're restarting execution from the start so it's not treated as jump"""
+		self._restart = True
 
 	def finalize(self):
 		if self._finalized:
@@ -330,6 +344,7 @@ class Graph(ida_graph.GraphViewer):
 	# ------------------------ MISC ------------------------
 
 	def get_info(self) -> dict:
+		assert self._finalized, "Graph must be finalized"
 		info = {
 			"database": idc.get_root_filename(),
 			"crc": ida_nalt.retrieve_input_file_crc32(),
@@ -347,7 +362,7 @@ class Graph(ida_graph.GraphViewer):
 		s += f"[+] imagebase: {info['imagebase']:X}" + "\n"
 		s += f"[+] nodes: {info['nodeCount']}" + "\n"
 		s += f"[+] instructions: {info['insnCount']}" + "\n"
-		s += f"[+] start: {info['startEa']:X} ({info['startEa'] - info['imagebase']:X})" + "\n"
+		s += f"[+] start: {info['startEa']:X} ({info['startEa'] - info['imagebase']:X})"
 		return s
 
 	def dot(self) -> str:

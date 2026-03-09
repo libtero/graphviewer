@@ -21,9 +21,16 @@ This tool solves that problem by converting execution traces recorded from debug
 - Save and load complete graphs to and from disk for later analysis.
 - Allows exporting to Graphviz `.dot` format for visualization and further analysis.
 
+## Basic Block Boundaries
+GraphViewer defines a new basic block boundary at any instruction that satisfies either of the following conditions:
+
+- **It is a control flow instruction.** Any instruction that is the destination of a control flow instruction (jump, call, etc.) starts a new block. This is determined by `Proc.is_cf()`, which your architecture implementation defines.
+- **It is a convergence point.** If the same address appears as the next instruction from two or more different instructions across all processed passes, it means multiple execution paths lead to it. GraphViewer detects this and promotes the address to a block start.
+
+This means the graph reflects only what was actually observed in the trace. An address that was branched to in one pass but fell through in another will still be recognized as a block boundary, because it was seen as a branch target at least once.
+
 
 ## Usage
-
 ```python
 proc = Proc_x86_64()
 trace_graph = Graph("Graph Name", proc)
@@ -55,7 +62,69 @@ trace_graph = Graph("My Trace", proc).load(file_path)
 trace_graph.Show()
 ```
 
-## Important Notes
+#### Processing Multiple Execution Passes
+When re-running the same code from the start (e.g. a loop iteration or a second emulation pass), call `.restart()` before feeding the first instruction of the new pass. Without it, GraphViewer would incorrectly create an edge from the last instruction to the starting instruction.
 
--  This tool visualizes the *recorded path*. It does not discover branches that were not taken during the trace.
+```python
+proc = Proc_x86_64()
+trace_graph = Graph("Multi-pass Trace", proc)
+
+for pass_index, pass_trace in enumerate(all_passes):
+    if pass_index > 0:
+        trace_graph.restart()
+    for ea in pass_trace:
+        trace_graph.process(ea)
+
+trace_graph.Show()
+```
+
+#### Handling Undecodable Branches During Code Coverage
+When building code coverage of an obfuscated function by emulating multiple execution paths, some branches may lead to addresses that are intentionally invalid or never meant to be executed (opaque predicates). These branches often point into the middle of an existing valid instruction — breaking it into an undecodable byte sequence — rather than to a clean instruction boundary. Feeding such an address to `.process()` will raise `InsnDecodeException`.
+
+The recommended pattern is to catch the exception and call `.restart()` immediately, then continue with the next pass. This discards the broken path cleanly without corrupting the graph state or creating a spurious edge into the next pass.
+
+```python
+proc = Proc_x86_64()
+trace_graph = Graph("Coverage Trace", proc)
+
+for pass_index, pass_trace in enumerate(all_passes):
+    if pass_index > 0:
+        trace_graph.restart()
+    for ea in pass_trace:
+        try:
+            trace_graph.process(ea)
+        except InsnDecodeException:
+            trace_graph.restart()
+            break
+
+trace_graph.Show()
+```
+
+#### Highlighting Instructions
+Individual instructions can be visually highlighted in the graph using `.set_highlight()` on an `Insn` object. This is useful for drawing attention to instructions of interest — such as tainted data sources, suspicious memory accesses, or any instruction identified during analysis.
+
+By default, `.set_highlight()` uses `SCOLOR_IMPNAME` (typically pink), but any IDA's `SCOLOR_` color constant can be passed.
+
+```python
+trace_graph.finalize()
+
+tainted_eas = [0x140001008, 0x14000100D]
+for ea in tainted_eas:
+    insn = trace_graph.get_insn(ea)
+    if insn:
+        insn.set_highlight()
+
+trace_graph.Show()
+```
+
+To revert an instruction back to its default appearance:
+
+```python
+insn = trace_graph.get_insn(0x140001008)
+if insn:
+    insn.unset_highlight()
+```
+
+## Important Notes
+- This tool visualizes the *recorded path*. It does not discover branches that were not taken during the trace.
 - For the clearest results, it is recommended to filter out instructions past `call` (except when the call is in fact obfuscated `jmp`) and keep processing again after return.
